@@ -36,9 +36,13 @@ fn command_needs_direct_tty(command: &[String]) -> bool {
     //     model, so there is no faithful reconstruction. Routing
     //     opencode straight through the terminal (no status bar)
     //     preserves its own absolute glyph positioning.
+    //   - vibe: Mistral Vibe's Rust TUI is the same class of full-screen
+    //     terminal app (ratatui, half-block/box-drawing glyphs): the
+    //     status-bar overlay reprints its frame line on every redraw
+    //     and makes it unusable, so it needs the same passthrough.
     matches!(
         command::effective_name(command),
-        Some("crush") | Some("opencode")
+        Some("crush") | Some("opencode") | Some("vibe")
     )
 }
 
@@ -1613,6 +1617,16 @@ mod tests {
             "run".into(),
             "opencode".into(),
         ]));
+    }
+
+    #[test]
+    fn vibe_requires_direct_tty() {
+        // vibe's Rust TUI is a full-screen ratatui app like opencode's;
+        // the vt100 status-bar overlay garbles it on every redraw.
+        assert!(command_needs_direct_tty(&["vibe".into()]));
+        assert!(command_needs_direct_tty(
+            &["/home/x/.local/bin/vibe".into()]
+        ));
     }
 
     #[test]
