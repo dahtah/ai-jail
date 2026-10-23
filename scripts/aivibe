@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+# aivibe — run Mistral Vibe inside an ai-jail sandbox, optionally with a
+# jailed Kaimon (Julia MCP server) alongside it.
+#
+# See docs/vibe-kaimon-setup.md for the full guide, setup steps, and the
+# reasoning behind the mount/env choices.
+#
+# Usage:
+#   aivibe [--with-kaimon] [--kaimon-port N] [--monitor-repl] [--no-keyring]
+#          [--session-bus] [--skip-warm] [--no-terminal-passthrough]
+#          [--ai-jail PATH] [--dry-run] [--] [vibe args...]
+#
+# The Mistral API key is resolved in this order and passed into the
+# sandbox as MISTRAL_API_KEY:
+#   1. an existing MISTRAL_API_KEY in the host environment
+#   2. ~/.vibe/.env (vibe reads it itself inside the sandbox)
+#   3. the GNOME keyring (read on the host, before entering the sandbox;
+#      --no-keyring skips this)
+# The keyring is never exposed to the sandbox — only the single key is.
+#
+# Examples:
+#   aivibe                          # jailed vibe, filtered egress
+#   aivibe --with-kaimon            # + jailed Kaimon + Julia REPL sessions
+#   aivibe --with-kaimon --monitor-repl   # + a monitor REPL in a second
+#                                         # terminal window (mirrors agent
+#                                         # activity; stays inside the jail)
+#   aivibe --with-kaimon --kaimon-port 2830   # host Kaimon keeps 2828
+#   aivibe -- -p 'do the thing'     # everything after --/--first-vibe-arg
+#                                   # is passed to vibe
+
+set -euo pipefail
+
+usage() {
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+die() {
+    echo "aivibe: $*" >&2
+    exit 1
+}
+
+# ---- defaults ---------------------------------------------------------------
+
+KAIMON_PORT=2828
+WITH_KAIMON=0
+MONITOR_REPL=0
+NO_KEYRING=0
+SESSION_BUS=0
+NO_TERMPASS=0
+SKIP_WARM=0
+DRY_RUN=0
+AI_JAIL_BIN="${AI_JAIL:-ai-jail}"
+VIBE_ARGS=()
+
+# ---- argument parsing -------------------------------------------------------
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --with-kaimon) WITH_KAIMON=1 ;;
+        --kaimon-port) [ $# -ge 2 ] || die "--kaimon-port needs a value"; KAIMON_PORT=$2; shift ;;
+        --monitor-repl) MONITOR_REPL=1 ;;
+        --no-keyring) NO_KEYRING=1 ;;
+        --no-terminal-passthrough) NO_TERMPASS=1 ;;
+        --session-bus) SESSION_BUS=1 ;;
+        --skip-warm) SKIP_WARM=1 ;;
+        --ai-jail) [ $# -ge 2 ] || die "--ai-jail needs a path"; AI_JAIL_BIN=$2; shift ;;
+        --dry-run) DRY_RUN=1 ;;
+        -h|--help) usage 0 ;;
+        --) shift; VIBE_ARGS=("$@"); break ;;
+        *) VIBE_ARGS=("$@"); break ;; # first vibe argument ends our options
+    esac
+    shift
+done
+
+command -v "$AI_JAIL_BIN" >/dev/null 2>&1 || die "ai-jail not found ($AI_JAIL_BIN)"
+
+# ---- host-side discovery ----------------------------------------------------
+
+# Walk the symlink chain manually (NOT readlink -f): canonicalization can
+# rewrite $HOME to a different spelling of the same directory (hosts where
+# $HOME is reachable via several paths), and only the $HOME spelling is
+# mounted inside the sandbox.
+walk_links() {
+    local p=$1 t
+    while [ -L "$p" ]; do
+        t=$(readlink "$p") || return 1
+        case $t in
+            /*) p=$t ;;
+            *) p="$(dirname "$p")/$t" ;;
+        esac
+    done
+    printf '%s\n' "$p"
+}
+
+VIBE_BIN="$(command -v vibe)" || die "vibe not found on PATH"
+VIBE_REAL="$(walk_links "$VIBE_BIN")"
+
+# The uv tool venv holding the vibe package: bind its root read-only so the
+# entry-point interpreter can import it (bin/ alone is not enough).
+VENV_MAP=()
+VENV_ROOT="$(dirname "$(dirname "$VIBE_REAL")")"
+if [ -f "$VENV_ROOT/pyvenv.cfg" ]; then
+    VENV_MAP=(--map "$VENV_ROOT")
+fi
+
+# julia (juliaup): resolve the version-pinned binary directly. The juliaup
+# launcher symlink and the generated app shims hardcode absolute install
+# paths that may not resolve inside the sandbox.
+find_julia() {
+    ls -d "$HOME"/.julia/juliaup/julia-*/bin/julia 2>/dev/null | sort -V | tail -1
+}
+
+if [ "$WITH_KAIMON" -eq 1 ]; then
+    JULIA_BIN="$(find_julia)"
+    [ -n "$JULIA_BIN" ] || die "no julia found under ~/.julia/juliaup (required with --with-kaimon)"
+    [ -d "$HOME/.julia/environments/apps/Kaimon" ] || die "Kaimon app environment not found (~/.julia/environments/apps/Kaimon)"
+fi
+
+# The jail-owned Julia depot. Inside the sandbox this is
+# $HOME/.cache/julia-jail; ai-jail's toolchains feature maps ~/.cache to
+# this host path, so the depot persists across runs.
+JAIL_DEPOT_HOST="$HOME/.local/share/ai-jail/cache/xdg/julia-jail"
+
+# Warm the jail depot from outside the sandbox (one-time). Precompiling
+# inside the jail fails for packages whose init touches blocked syscalls
+# (e.g. ZMQ: libzmq aborts when getifaddrs returns EPERM).
+if [ "$WITH_KAIMON" -eq 1 ] && [ "$SKIP_WARM" -eq 0 ] && [ ! -d "$JAIL_DEPOT_HOST/compiled" ]; then
+    echo "aivibe: warming the jail Julia depot (one-time; a few minutes)..."
+    JULIA_DEPOT_PATH="$JAIL_DEPOT_HOST:$HOME/.julia" \
+    JULIA_LOAD_PATH="$HOME/.julia/environments/apps/Kaimon" \
+        "$JULIA_BIN" --startup-file=no -e 'using Kaimon'
+    echo "aivibe: depot warmed."
+fi
+
+# --with-kaimon implies --network (see docs: filtered-egress mode proxies
+# localhost HTTP, which blocks the in-jail MCP endpoint). With --network
+# the sandbox shares the host network namespace, so the jailed Kaimon must
+# not collide with a host listener.
+if [ "$WITH_KAIMON" -eq 1 ]; then
+    if (exec 3<>"/dev/tcp/127.0.0.1/$KAIMON_PORT") 2>/dev/null; then
+        die "port $KAIMON_PORT is already in use — stop the host Kaimon first, or pass --kaimon-port <other>"
+    fi
+fi
+
+# ---- API key resolution -----------------------------------------------------
+
+# Read the MISTRAL_API_KEY from the GNOME keyring (vibe's own storage:
+# the Python keyring library with service ai.mistral.vibe). Runs on the
+# host; the sandbox never sees the keyring, only the key.
+keyring_key() {
+    python3 - <<'PYEOF' 2>/dev/null
+try:
+    import secretstorage
+    bus = secretstorage.dbus_init()
+    for col in secretstorage.get_all_collections(bus):
+        if col.is_locked():
+            continue
+        for item in col.get_all_items():
+            a = item.get_attributes()
+            if a.get("service") == "ai.mistral.vibe" and a.get("username") == "MISTRAL_API_KEY":
+                s = item.get_secret().decode().strip()
+                if s:
+                    print(s)
+                raise SystemExit(0)
+except Exception:
+    pass
+raise SystemExit(1)
+PYEOF
+}
+
+API_KEY_ARG=""
+KEY_SOURCE=""
+if [ -n "${MISTRAL_API_KEY:-}" ]; then
+    API_KEY_ARG="MISTRAL_API_KEY=$MISTRAL_API_KEY"
+    KEY_SOURCE="host environment"
+elif [ -f "$HOME/.vibe/.env" ]; then
+    KEY_SOURCE="~/.vibe/.env (read by vibe itself)"
+elif [ "$NO_KEYRING" -eq 0 ]; then
+    KEY="$(keyring_key || true)"
+    if [ -n "$KEY" ]; then
+        API_KEY_ARG="MISTRAL_API_KEY=$KEY"
+        KEY_SOURCE="GNOME keyring"
+    fi
+fi
+if [ -z "$KEY_SOURCE" ]; then
+    echo "aivibe: no MISTRAL_API_KEY in the environment, ~/.vibe/.env, or the keyring" >&2
+    echo "aivibe: run 'vibe --setup' once, or export MISTRAL_API_KEY" >&2
+fi
+
+# ---- monitor REPL (--monitor-repl, requires --with-kaimon) -------------------
+
+# The monitor REPL runs INSIDE the sandbox (same jail as Kaimon), in a
+# tmux server whose socket lives on the project directory — the one path
+# shared with the host. A terminal window on the host attaches to it, so
+# you watch (and can join) the agent's Julia activity. Keeping the REPL
+# inside the jail matters: a connected gate session is an eval target,
+# and an unjailed monitor would give agent code a way out.
+if [ "$MONITOR_REPL" -eq 1 ]; then
+    [ "$WITH_KAIMON" -eq 1 ] || die "--monitor-repl requires --with-kaimon"
+    command -v tmux >/dev/null 2>&1 || die "--monitor-repl requires tmux"
+    # Only the socket FILENAME is shared; each side builds the full path
+    # from its own $PWD. ai-jail canonicalizes the project directory when
+    # mounting it into the sandbox, so the sandbox's project path may use a
+    # different spelling of the same directory than the host's (e.g.
+    # /home/user/... vs /nethome/user/...). An absolute host path can
+    # therefore dangle inside the jail; $PWD is correct on both sides.
+    MON_NAME=".aivibe-monitor-$$.sock"
+    MON_SOCK="$PWD/$MON_NAME"
+
+    # Attach loop for the second terminal window: wait for the jailed
+    # tmux server, attach, re-attach after detach, exit when the jail
+    # goes away and the server dies.
+    ATTACH_LOOP='
+S=$1
+echo "aivibe: waiting for the monitor REPL (tmux socket $S)..."
+while ! tmux -S "$S" ls >/dev/null 2>&1; do sleep 0.5; done
+while tmux -S "$S" ls >/dev/null 2>&1; do
+    tmux -S "$S" attach || sleep 0.5
+done
+echo "aivibe: monitor session ended."
+'
+
+    TERM_BIN="${AIVIBE_TERMINAL:-}"
+    if [ -z "$TERM_BIN" ]; then
+        if command -v gnome-terminal >/dev/null 2>&1; then
+            TERM_BIN="gnome-terminal --"
+        elif command -v xterm >/dev/null 2>&1; then
+            TERM_BIN="xterm -e"
+        fi
+    fi
+    if [ -n "$TERM_BIN" ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+        # shellcheck disable=SC2086
+        read -ra TERM_CMD <<< "$TERM_BIN"
+        "${TERM_CMD[@]}" bash -c "$ATTACH_LOOP" attach "$MON_SOCK" &
+        echo "aivibe: monitor window opening (socket: $MON_SOCK)"
+    else
+        echo "aivibe: no terminal emulator/display; attach manually with:" >&2
+        echo "  tmux -S '$MON_SOCK' attach" >&2
+    fi
+fi
+
+# ---- sandbox arguments ------------------------------------------------------
+
+JAIL_ARGS=()
+# The Rust TUI is a full-screen terminal app: ai-jail's vt100 status-bar
+# overlay reprints its frame line on every redraw and garbles the display
+# (same class of problem as opencode, see ai-jail's
+# command_needs_direct_tty). Disable only the status bar — the PTY
+# proxy's terminal escape-sequence filtering stays active.
+JAIL_ARGS+=(--no-status-bar)
+# Clipboard: terminal apps copy/paste via OSC 52 escape sequences, which
+# ai-jail's PTY proxy forwards only in terminal-passthrough mode. The
+# alt-screen vt100 reconstruction (the escape filtering itself) stays
+# active with this flag; see docs for the tradeoffs. Opt out with
+# --no-terminal-passthrough if you do not want the sandboxed TUI to
+# reach the clipboard at all.
+[ "$NO_TERMPASS" -eq 0 ] && JAIL_ARGS+=(--terminal-passthrough)
+if [ "$WITH_KAIMON" -eq 1 ]; then
+    JAIL_ARGS+=(--network)
+else
+    # Stock ai-jail does not know vibe as an API agent, so its default
+    # filtered egress does not cover the model API host.
+    JAIL_ARGS+=(--allow-host api.mistral.ai)
+fi
+[ "$SESSION_BUS" -eq 1 ] && JAIL_ARGS+=(--systemd-user)
+
+if [ -n "$API_KEY_ARG" ]; then
+    JAIL_ARGS+=(--env "$API_KEY_ARG")
+fi
+
+if [ -f "$VENV_ROOT/pyvenv.cfg" ]; then
+    JAIL_ARGS+=("${VENV_MAP[@]}")
+fi
+[ -d "$HOME/.vibe" ] && JAIL_ARGS+=(--rw-map "$HOME/.vibe")
+JAIL_ARGS+=(--env "AIVIBE_VIBE=$VIBE_REAL")
+
+if [ "$WITH_KAIMON" -eq 1 ]; then
+    JAIL_ARGS+=(--map "$HOME/.julia" --rw-map "$HOME/.config/kaimon")
+    JAIL_ARGS+=(--env "AIVIBE_KAIMON_PORT=$KAIMON_PORT")
+fi
+if [ "$MONITOR_REPL" -eq 1 ]; then
+    JAIL_ARGS+=(--env "AIVIBE_MON_NAME=$MON_NAME")
+fi
+
+# ---- inner launcher (runs inside the sandbox) -------------------------------
+
+read -r -d '' INNER <<'EOS' || true
+set -u
+VIBE="${AIVIBE_VIBE:-vibe}"
+[ -x "$VIBE" ] || VIBE="vibe"
+if [ -n "${AIVIBE_KAIMON_PORT:-}" ]; then
+    JULIA=$(ls -d "$HOME"/.julia/juliaup/julia-*/bin/julia 2>/dev/null | sort -V | tail -1)
+    export JULIA_DEPOT_PATH="$HOME/.cache/julia-jail:$HOME/.julia"
+    export JULIA_LOAD_PATH="$HOME/.julia/environments/apps/Kaimon"
+    LOG="/tmp/kaimon-jail-$$.log"
+    KP=""
+    MON_SOCK=""
+    cleanup() {
+        [ -n "$KP" ] && kill "$KP" 2>/dev/null
+        if [ -n "$MON_SOCK" ]; then
+            tmux -S "$MON_SOCK" kill-server 2>/dev/null
+            rm -f "$MON_SOCK"
+        fi
+    }
+    trap 'cleanup; exit 130' INT TERM
+    trap cleanup EXIT
+    "$JULIA" --startup-file=no --threads=auto,2 --gcthreads=1 \
+        -m Kaimon --headless --port "$AIVIBE_KAIMON_PORT" >"$LOG" 2>&1 &
+    KP=$!
+    ready=""
+    for _ in $(seq 1 60); do
+        if (exec 3<>"/dev/tcp/127.0.0.1/$AIVIBE_KAIMON_PORT") 2>/dev/null; then
+            ready=1
+            break
+        fi
+        kill -0 "$KP" 2>/dev/null || break
+        sleep 1
+    done
+    if [ -z "$ready" ]; then
+        echo "aivibe: jailed Kaimon failed to start; last log lines:" >&2
+        tail -5 "$LOG" >&2
+        cleanup
+        exit 1
+    fi
+    echo "aivibe: jailed Kaimon listening on 127.0.0.1:$AIVIBE_KAIMON_PORT (log: $LOG)"
+    if [ -n "${AIVIBE_MON_NAME:-}" ] && command -v tmux >/dev/null 2>&1; then
+        # Monitor REPL: jailed Julia REPL (project env, interactive) whose
+        # gate connects to the jailed Kaimon over the jail-internal ipc
+        # socket. The tmux socket sits on the project dir (shared with the
+        # host) so a host terminal can attach — built from THIS side's
+        # $PWD, since the sandbox's project path spelling can differ from
+        # the host's. KaimonGate resolves through the default environment,
+        # so JULIA_LOAD_PATH (set above for the Kaimon app env) is unset
+        # for the REPL.
+        MON_SOCK="$PWD/$AIVIBE_MON_NAME"
+        rm -f "$MON_SOCK"
+        if tmux -S "$MON_SOCK" new-session -d -s aivibe-monitor \
+            "env -u JULIA_LOAD_PATH \"$JULIA\" -i --startup-file=no --project=\"$PWD\" -e 'using KaimonGate; KaimonGate.serve(allow_mirror=true)'"
+        then
+            echo "aivibe: monitor REPL running in tmux session 'aivibe-monitor'"
+        else
+            echo "aivibe: failed to start the monitor REPL" >&2
+            rm -f "$MON_SOCK"
+        fi
+    fi
+fi
+"$VIBE" "$@"
+rc=$?
+exit "$rc"
+EOS
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "ai-jail arguments:"
+    for a in "${JAIL_ARGS[@]}"; do
+        case $a in
+            MISTRAL_API_KEY=*) echo "  MISTRAL_API_KEY=<elided>" ;;
+            *) echo "  $a" ;;
+        esac
+    done
+    [ -n "$KEY_SOURCE" ] && echo "api key source: $KEY_SOURCE"
+    echo "--- inner script ---"
+    printf '%s\n' "$INNER"
+    exit 0
+fi
+
+if [ -n "$KEY_SOURCE" ]; then
+    echo "aivibe: api key from $KEY_SOURCE"
+fi
+
+if [ "$WITH_KAIMON" -eq 1 ]; then
+    exec "$AI_JAIL_BIN" "${JAIL_ARGS[@]}" bash -c "$INNER" aivibe "${VIBE_ARGS[@]}"
+fi
+# No Kaimon: run vibe as the jail command directly. The wrapper is not
+# needed, and ai-jail's per-command handling (notably the direct-terminal
+# passthrough for vibe's TUI) keys off the command name.
+exec "$AI_JAIL_BIN" "${JAIL_ARGS[@]}" "$VIBE_REAL" "${VIBE_ARGS[@]}"
