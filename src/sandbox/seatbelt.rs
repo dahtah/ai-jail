@@ -1241,6 +1241,9 @@ fn agent_state_paths(config: &Config) -> Vec<PathBuf> {
         // whole ~/.prime (the prime compute CLI's API key lives in
         // the sibling config.json).
         Some("prime-agent") => push(".prime/agent"),
+        // Mirrors the bwrap-side list: Mistral Vibe's config, skills,
+        // session history, and login state all live under ~/.vibe.
+        Some("vibe") => push(".vibe"),
         Some("devin") => {
             let data_root =
                 super::devin_installation_dir(config).and_then(|versions| {
@@ -3280,6 +3283,7 @@ mod tests {
             // Only .prime/agent, never the whole ~/.prime: sibling
             // config.json holds the prime CLI's API key.
             (vec!["prime-agent"], vec![".prime/agent"]),
+            (vec!["vibe"], vec![".vibe"]),
         ] {
             let config = Config {
                 command: command

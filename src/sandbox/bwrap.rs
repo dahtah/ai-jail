@@ -2262,6 +2262,9 @@ fn command_state_paths(config: &Config) -> &'static [&'static str] {
         // whole ~/.prime: sibling config.json holds the prime CLI's
         // compute/sandbox API key.
         Some("prime-agent") => &[".prime/agent"],
+        // Mistral Vibe keeps config, skills, MCP server definitions,
+        // session history, and login/session state under ~/.vibe.
+        Some("vibe") => &[".vibe"],
         _ => &[],
     }
 }
@@ -2686,6 +2689,31 @@ fn discover_command_binary(
             paths.push(path);
         }
     }
+    // A Python venv's `bin/` directory alone is not enough: the entry
+    // script's interpreter derives its prefix — and with it
+    // `lib/pythonX.Y/site-packages` — from the venv root, so binding only
+    // `bin/` leaves the tool startable but unimportable
+    // (`ModuleNotFoundError`). uv (`uv tool install`) and pipx both
+    // install into venvs under `~/.local/share`, which the private home
+    // hides. Upgrade any venv `bin/` to its root (marked by the
+    // standard `pyvenv.cfg`) so Python tools start working.
+    paths = paths
+        .into_iter()
+        .map(|p| match venv_root_for_bin_dir(&p) {
+            Some(root) => {
+                if verbose {
+                    output::verbose(&format!(
+                        "Command binary: {} is a Python venv bin; \
+                         binding venv root {} ro",
+                        p.display(),
+                        root.display()
+                    ));
+                }
+                root
+            }
+            None => p,
+        })
+        .collect();
     // A path under an already-bound directory is redundant, and binding it
     // can fail: after `~/.local/bin` is mounted, `~/.local/bin/claude` is a
     // dangling symlink until its versions dir is mounted (#138).
@@ -2758,6 +2786,21 @@ fn command_mount_path(path: &Path) -> PathBuf {
     } else {
         path.to_path_buf()
     }
+}
+
+/// If `path` is a Python venv's `bin/` directory, return the venv root.
+/// `pyvenv.cfg` beside `bin/` is the standard marker (uv tool, pipx, and
+/// plain `python -m venv` all create it); `lib/pythonX.Y/site-packages`
+/// sits beside `bin/` and is what the entry-point interpreter imports the
+/// tool from, so the bind must cover the root, not just `bin/`.
+fn venv_root_for_bin_dir(path: &Path) -> Option<PathBuf> {
+    if path.file_name()? != "bin" {
+        return None;
+    }
+    let root = path.parent()?;
+    root.join("pyvenv.cfg")
+        .is_file()
+        .then(|| root.to_path_buf())
 }
 
 fn discover_local_overrides() -> Vec<Mount> {
@@ -5309,6 +5352,73 @@ mod tests {
     }
 
     #[test]
+    fn private_home_binds_uv_tool_venv_root() {
+        // uv (`uv tool install`) and pipx install into a venv under
+        // `~/.local/share`, hidden by the private home. The `bin/`
+        // directory alone leaves the entry-point interpreter unable to
+        // import the tool (ModuleNotFoundError); the whole venv root —
+        // marked by pyvenv.cfg — must be bound instead.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-bwrap-cmd-home-uv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let venv = home.join(".local/share/uv/tools/tool");
+        std::fs::create_dir_all(venv.join("lib/python3.12/site-packages"))
+            .unwrap();
+        std::fs::create_dir_all(venv.join("bin")).unwrap();
+        std::fs::write(venv.join("pyvenv.cfg"), b"home = /usr/bin\n").unwrap();
+        std::fs::write(venv.join("bin/tool"), "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            venv.join("bin/tool"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.join(".local/bin")).unwrap();
+        std::os::unix::fs::symlink(
+            venv.join("bin/tool"),
+            home.join(".local/bin/tool"),
+        )
+        .unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _path =
+            EnvVarGuard::set("PATH", prepend_path(&home.join(".local/bin")));
+
+        let config = Config {
+            command: vec!["tool".into()],
+            private_home: Some(true),
+            ..minimal_test_config()
+        };
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let args = build_dry_run_args(
+            &config,
+            &home.join("project"),
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+
+        assert!(has_symlink(
+            &args,
+            &venv.join("bin/tool"),
+            &home.join(".local/bin/tool")
+        ));
+        assert!(
+            has_ro_bind(&args, &venv),
+            "venv root must be bound so site-packages is importable"
+        );
+        assert!(
+            !has_ro_bind(&args, &venv.join("bin")),
+            "bin/ alone must not be bound; it is covered by the venv root"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn private_home_skips_command_paths_under_bound_dir() {
         // Regression for #138: with ai-memory and the Claude installer
         // symlink both in ~/.local/bin, binding `~/.local/bin/claude` after
@@ -6741,6 +6851,48 @@ mod tests {
     }
 
     #[test]
+    fn vibe_state_mounted_with_agent_state() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir()
+            .join(format!("ai-jail-vibe-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let vibe_dir = home.join(".vibe");
+        std::fs::create_dir_all(vibe_dir.join("skills")).unwrap();
+
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        // Default (agent-state on): ~/.vibe is mounted rw so vibe
+        // starts with its config, skills, and session history.
+        let mut config = minimal_test_config();
+        config.command = vec!["vibe".into()];
+        let mounts =
+            discover_home_dotfiles_full(&config, true, &[], false, false);
+        assert!(
+            mounts.iter().any(|m| matches!(
+                m,
+                Mount::Bind { src, dest }
+                    if src == &vibe_dir && dest == &vibe_dir
+            )),
+            "~/.vibe is mounted by default (agent_state on)"
+        );
+
+        // Opt out with --no-agent-state: state dir stays hidden.
+        config.agent_state = Some(false);
+        let mounts =
+            discover_home_dotfiles_full(&config, true, &[], false, false);
+        assert!(
+            !mounts.iter().any(|m| matches!(
+                m,
+                Mount::Bind { src, dest }
+                    if src == &vibe_dir && dest == &vibe_dir
+            )),
+            "~/.vibe hidden with --no-agent-state"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn hide_dotdir_overrides_agent_state_mounts() {
         // "User hides win": --hide-dotdir .claude suppresses the
         // agent-state mounts even with the capability enabled.
@@ -6840,6 +6992,7 @@ mod tests {
             // Only .prime/agent, never the whole ~/.prime: sibling
             // config.json holds the prime CLI's API key.
             ("prime-agent", &[".prime/agent"]),
+            ("vibe", &[".vibe"]),
         ];
         for (command, expected) in cases {
             let mut config = minimal_test_config();

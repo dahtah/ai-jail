@@ -190,6 +190,7 @@ const KNOWN_API_AGENTS: &[&str] = &[
     "soulforge",
     "omp",
     "kiro-cli",
+    "vibe",
 ];
 
 fn is_known_api_agent(name: &str) -> bool {
@@ -206,6 +207,7 @@ fn api_host(name: &str) -> Option<&'static str> {
         "gemini" => Some("generativelanguage.googleapis.com"),
         "grok" => Some("api.x.ai"),
         "devin" => Some("server.codeium.com"),
+        "vibe" => Some("api.mistral.ai"),
         _ => None,
     }
 }
@@ -240,6 +242,7 @@ pub(crate) fn harness_api_key_env(name: &str) -> &'static [&'static str] {
         "codex" => &["OPENAI_API_KEY"],
         "gemini" | "antigravity" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
         "grok" => &["XAI_API_KEY"],
+        "vibe" => &["MISTRAL_API_KEY"],
         _ if name.starts_with("kimi") => &["MOONSHOT_API_KEY"],
         _ => &[],
     }
@@ -520,6 +523,7 @@ mod tests {
             &["GEMINI_API_KEY", "GOOGLE_API_KEY"]
         );
         assert_eq!(harness_api_key_env("grok"), &["XAI_API_KEY"]);
+        assert_eq!(harness_api_key_env("vibe"), &["MISTRAL_API_KEY"]);
         assert_eq!(harness_api_key_env("kimi-code"), &["MOONSHOT_API_KEY"]);
         assert!(harness_api_key_env("bash").is_empty());
     }

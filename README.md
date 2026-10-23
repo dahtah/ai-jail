@@ -126,11 +126,11 @@ ai-jail devin --permission-mode dangerous
   home.
 - **Agent/harness auth (`agent_state`)** — the invoked harness's own
   credential/state dir (for example `~/.claude`, `~/.codex`,
-  `~/.kimi`, `~/.gemini`, `~/.kiro`) is mounted **read-write** so it starts
-  pre-authenticated instead of asking you to log in every session; its
+  `~/.kimi`, `~/.gemini`, `~/.kiro`, `~/.vibe`) is mounted **read-write** so it
+  starts pre-authenticated instead of asking you to log in every session; its
   known API-key env var (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
-  `GEMINI_API_KEY`/`GOOGLE_API_KEY`, `XAI_API_KEY`, `MOONSHOT_API_KEY`) is
-  also copied from the host when set. This is the trade-off for being
+  `GEMINI_API_KEY`/`GOOGLE_API_KEY`, `XAI_API_KEY`, `MOONSHOT_API_KEY`,
+  `MISTRAL_API_KEY`) is also copied from the host when set. This is the trade-off for being
   developer-friendly: anything running in the sandbox can use those
   credentials for the life of the launch. `--no-agent-state` opts out for
   an isolated, logged-out run.
